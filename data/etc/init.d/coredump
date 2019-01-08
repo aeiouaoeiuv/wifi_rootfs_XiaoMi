@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+
+#for test, activate later
+START=70
+STOP=10
+SERVICE_USE_PID=1
+SERVICE_QUIET="1"
+EXTRA_COMMANDS=" demo "
+
+start() {
+	[ -e /proc/sys/kernel/core_pattern ] && {
+		echo '/tmp/core' > /proc/sys/kernel/core_pattern
+	}
+	return 0
+}
+
+stop() {
+	[ -e /proc/sys/kernel/core_pattern ] && {
+		echo > /proc/sys/kernel/core_pattern
+	}
+	return 0
+}
+
+demo() {
+	ulimit -c unlimited
+	/bin/sleep 100 &
+	kill -SIGSEGV %%
+}

@@ -1,0 +1,4 @@
+
+config core 'common'
+	option admin '4889ccc84497509a740b42476d9d074cfc0faf99'
+

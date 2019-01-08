@@ -1,0 +1,86 @@
+#!/bin/sh
+
+usage () {
+    echo "set redirect rule for revproxy"
+    echo "$0 create [rule_set_name] [src_dport] [dest_port] - create redirect rule"
+    echo "$0 add [rule_set_name] [domain] - redirect access to dest_port"
+    echo "$0 delete [rule_set_name] [domain] - delete rule"
+    echo "$0 reload [rule_set_name] - redo apply rule"
+    exit 1
+}
+
+export LOADER='/lib/firewall/revproxy.loader'
+
+reload_redirect() {
+    /etc/init.d/firewall restart
+}
+
+# rule_set src_dport dest_port
+create_redirect() {
+    rule_set="$1_proxy"
+    shift
+    src_dport="$1"
+    shift
+    dest_port="$1"
+    [ -f '/etc/config/revproxy' ] || touch /etc/config/revproxy
+    uci -q batch <<EOF > /dev/null
+set revproxy.$rule_set=domain_dest
+set revproxy.$rule_set.src_dport=$src_dport
+set revproxy.$rule_set.dest_port=$dest_port
+set revproxy.$rule_set.enabled=0
+commit revproxy
+EOF
+    uci -q batch <<EOF > /dev/null
+set firewall.revproxy=include
+set firewall.revproxy.path=$LOADER
+set firewall.revproxy.reload=1
+set firewall.revproxy.enabled=1
+commit firewall
+EOF
+}
+
+del_redirect() {
+    rule_set="$1_proxy"
+    uci -q delete revproxy.$rule_set
+    uci commit revproxy
+    reload_redirect
+}
+
+# rule_set src_dip
+add_redirect() {
+    rule_set="$1_proxy"
+    uci -q add_list revproxy.$rule_set.src_dname="$2"
+    uci -q set revproxy.$rule_set.enabled=1
+    uci commit revproxy
+}
+
+case "$1" in
+    enable)
+	shift
+	enable_redirect "$1"
+    ;;
+    disable)
+	shift
+	disable_redirect "$1"
+    ;;
+    create)
+	shift
+	create_redirect "$@"
+	;;
+    add)
+	shift
+	add_redirect "$@"
+    ;;
+    delete)
+	shift
+	del_redirect "$1"
+	;;
+    reload)
+	shift
+	reload_redirect "$1"
+	;;
+    *)
+	usage
+    ;;
+esac
+

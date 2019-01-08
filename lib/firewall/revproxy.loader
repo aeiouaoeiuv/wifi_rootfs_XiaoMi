@@ -1,0 +1,31 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+dlog() {
+    logger -s -t revproxy "$1"
+}
+
+# do for earch rule set
+handle_rule_set() {
+    local config="$1"
+    local src_dport=
+    local dest_port=
+    local src_dname=
+    config_get_bool enabled "$config" enabled
+    [ "$enabled" == '1' ] || exit 0
+    config_get src_dport "$config" src_dport
+    config_get dest_port "$config" dest_port
+    config_get src_dname "$config" src_dname
+    [ -n "$src_dname" ] || exit 0
+    iptables -t nat -N $config || {
+	dlog "alread exist chain $config, try redo..."
+    }
+    iptables -t nat -A zone_lan_prerouting -p tcp -j $config
+    for dname in $src_dname; do
+	iptables -t nat -A $config -p tcp -d $dname --dport 80 -j REDIRECT --to-ports $dest_port
+    done
+}
+
+config_load revproxy
+config_foreach handle_rule_set domain_dest

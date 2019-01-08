@@ -1,0 +1,3 @@
+needPopUserInstruction = "true";
+ExtensionReady = "false";
+usbConnectKey = "usbConnectValue";

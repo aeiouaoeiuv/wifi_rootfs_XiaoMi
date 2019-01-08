@@ -1,0 +1,198 @@
+#!/usr/bin/lua
+
+local posix = require("posix")
+local fs = require("luci.fs")
+local sys = require("xiaoqiang.util.XQSysUtil")
+local netutil = require("xiaoqiang.util.XQNetUtil")
+local downloader = require("xiaoqiang.util.XQDownloadUtil")
+local xqfunction = require("xiaoqiang.common.XQFunction")
+local xqmbox = require("xiaoqiang.module.XQMessageBox")
+
+local miscpredflag = true
+local MIN, MAX = 3000, 3300
+
+function miscpred()
+    local uci = require("luci.model.uci").cursor()
+    local download = uci:get("misc", "ota_pred", "download")
+    if tonumber(download) and tonumber(download) == 1 then
+        miscpredflag = true
+    else
+        miscpredflag = false
+    end
+end
+
+function log(...)
+    local util = require("luci.util")
+    posix.openlog("predownload-ota", "np", LOG_USER)
+    for i, v in ipairs({...}) do
+        posix.syslog(4, util.serialize_data(v))
+    end
+    posix.closelog()
+end
+
+function uciget(key)
+    local uci = require("luci.model.uci").cursor()
+    if key then
+        return uci:get("otapred", "settings", key)
+    else
+        return nil
+    end
+end
+
+function uciset(key, value)
+    local uci = require("luci.model.uci").cursor()
+    if key then
+        if value then
+            uci:set("otapred", "settings", key, value)
+        else
+            uci:delete("otapred", "settings", key)
+        end
+        uci:commit("otapred")
+    end
+end
+
+function systemwakeup()
+    os.execute("killall -s 10 noflushd ")
+end
+
+function random()
+    math.randomseed(tostring(os.time()):reverse():sub(1, 6))
+    return math.random(MIN, MAX)
+end
+
+function randomsleep()
+    local seconds = tostring(random())
+    log("Update detection will start in "..seconds.." seconds")
+    os.execute("sleep "..seconds)
+end
+
+function finishedNotification(version)
+    local push = require("xiaoqiang.XQPushHelper")
+    local payload = {
+        ["type"] = 8,
+        ["data"] = {
+            ["version"] = version or ""
+        }
+    }
+    push.push_request_lua(payload)
+end
+
+function clearDir()
+    os.execute("rm /userdisk/download/*.bin")
+end
+
+function dotask()
+    log("Predownload-ota service start")
+    while true do
+        -- interval MIN ~ MAX s
+        randomsleep()
+        if xqfunction.sysLockStatus() ~= 1 then
+            log("Update detection start..")
+            local priority = tonumber(uciget("priority")) or 0
+            local auto = tonumber(uciget("auto")) or 0
+            local time = tonumber(uciget("time")) or 4
+            local hour = tonumber(os.date("%H", os.time()))
+            local check = netutil.checkUpgrade()
+            if check and check.needUpdate == 1 then
+                log("Update info:", check)
+                local updateurl = uciget("updateurl")
+                if updateurl ~= check.downloadUrl then
+                    systemwakeup()
+                    local hash, filepath = nil, nil
+                    if check.weight == 9 then
+                        uciset("updateurl", check.downloadUrl)
+                        log("Start downloading...")
+                        clearDir()
+                        hash, filepath = downloader.syncDownload(check.downloadUrl, priority, false)
+                        if not hash or not filepath then
+                            uciset("updateurl", "")
+                        end
+                    elseif auto == 1 then
+                        if hour == time then
+                            uciset("updateurl", check.downloadUrl)
+                            log("Start downloading...")
+                            clearDir()
+                            hash, filepath = downloader.syncDownload(check.downloadUrl, priority, false)
+                            if not hash or not filepath then
+                                uciset("updateurl", "")
+                            end
+                        else
+                            log("Time :"..hour)
+                        end
+                    else
+                        if miscpredflag then
+                            uciset("updateurl", check.downloadUrl)
+                            log("Start downloading...")
+                            clearDir()
+                            hash, filepath = downloader.syncDownload(check.downloadUrl, priority, false)
+                            if not hash or not filepath then
+                                uciset("updateurl", "")
+                            end
+                        end
+                    end
+                    -- notification
+                    if auto ~= 1 then
+                        uciset("updateurl", check.downloadUrl)
+                        finishedNotification(check.version)
+                    end
+                    -- message box
+                    xqmbox.addMessage({["type"] = 1, ["data"] = {["version"] = check.version}})
+                    -- flash
+                    if hash and filepath then
+                        if check.weight == 9 or auto == 1 then
+                            if check.fullHash == hash then
+                                log("Mandatory/Auto upgrade...")
+                                if fs.access(filepath) and not sys.verifyImage(filepath) then
+                                    log("Upgrade failed: Verify Image failed!")
+                                    fs.unlink(filepath)
+                                    uciset("updateurl", "")
+                                else
+                                    if xqfunction.sysLockStatus() ~= 1 then
+                                        xqfunction.sysLock()
+                                        sys.updateUpgradeStatus(5)
+                                        local cmdpending = miscpredflag and "" or " &"
+                                        local result = os.execute("flash.sh "..filepath..cmdpending)
+                                        if result ~= 0 then
+                                            sys.updateUpgradeStatus(10)
+                                            if fs.access(filepath) then
+                                                fs.unlink(filepath)
+                                            end
+                                            log("Upgrade failed: Flash failed!")
+                                            uciset("updateurl", "")
+                                        else
+                                            sys.updateUpgradeStatus(11)
+                                            log("Upgrade succeed!")
+                                        end
+                                    else
+                                        log("Upgrade failed: duplicate!")
+                                        uciset("updateurl", "")
+                                    end
+                                end
+                            else
+                                log("Upgrade failed: Wrong Hash!")
+                                uciset("updateurl", "")
+                            end
+                        end
+                    end
+                else
+                    log("Ignored, duplicate download")
+                end
+            elseif not check then
+                log("Detection failed: Server unreachable!!!")
+            else
+                log("No update!!!")
+            end
+        else
+            log("Ignored, syslock")
+        end
+    end
+end
+
+local enable = tonumber(uciget("enabled"))
+
+if enable == 1 then
+    miscpred()
+    dotask()
+else
+    log("Predownload-ota disabled!!!")
+end

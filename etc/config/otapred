@@ -1,0 +1,5 @@
+
+config ota 'settings'
+	option enabled '1'
+	option updateurl 'http://bigota.miwifi.com/xiaoqiang/rom/r1cm/miwifi_r1cm_all_6e814_1.0.9.bin'
+

@@ -1,0 +1,16 @@
+# failed logins from a single address before ban
+# uncomment to override conf.bfd trig value
+TRIG="15"
+
+# uncomment to disable alerting for this rule
+SKIP_ALERT="1"
+
+AUTH_LOG_PATH="/tmp/messages"
+
+PORTS="80"
+LP="$AUTH_LOG_PATH"
+TLOG_TF="luci"
+TMP="/tmp/bfd"
+
+ARG_VAL=$(ash $TLOG_PATH $LP $TLOG_TF | grep luci | grep 'Authentication failed' | cut -d ' ' -f4 | tr -d '"')
+

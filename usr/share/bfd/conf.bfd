@@ -1,0 +1,64 @@
+#!/bin/sh
+
+
+# how many failure events must an address have before being blocked?
+# you can override this on a per rule basis in /usr/local/bfd/rules/
+TRIG="15"
+
+# send email alerts for all events [0 = off; 1 = on]
+EMAIL_ALERTS="0"
+
+# local user or email address alerts are sent to (separate multiple with comma)
+EMAIL_ADDRESS="root"
+
+# subject of email alerts
+EMAIL_SUBJECT="Brute Force Warning for $HOSTNAME"
+
+# executable command to block attacking hosts
+BAN_COMMAND="sh /usr/share/bfd/ban.command $ATTACK_HOST"
+
+######
+# You should not need to edit any options below this line
+######
+
+# installation path
+INSTALL_PATH="/tmp/bfd"
+
+# rule files path
+RULES_PATH="/usr/share/bfd/rules"
+
+# track log script path
+TLOG_PATH="/usr/share/bfd/tlog"
+
+# syslog kernel log path
+KERNEL_LOG_PATH="/tmp/messages"
+
+# syslog auth log path
+AUTH_LOG_PATH="/tmp/messages"
+
+# bfd application log path
+BFD_LOG_PATH="/data/usr/log/bfd"
+
+# log all events to syslog [0 = off; 1 = on]
+OUTPUT_SYSLOG="1"
+
+# log file path for syslog logging
+OUTPUT_SYSLOG_FILE="/tmp/messages"
+
+# template of the email message body
+EMAIL_TEMPLATE="$INSTALL_PATH/alert.bfd"
+
+# contains list of files to search for addresses that are excluded from bans
+IGNORE_HOST_FILES="/usr/share/bfd/exclude.files"
+
+# grab the local time zone
+TIME_ZONE=`date +"%z"`
+
+# grab the local unix time
+TIME_UNIX=`date +"%s"`
+
+# lock file path
+LOCK_FILE="/tmp/bfd/lock.utime"
+
+# lock file timeout
+LOCK_FILE_TIMEOUT="300"

@@ -1,0 +1,6 @@
+
+config messaging 'deviceInfo'
+	option UPGRADE_STATUS_UPLOAD '0'
+	option DEVICE_ID '7a3d60f3-8876-4c2c-a23b-f087db0cc11e'
+	option CHANNEL_SECRET 'iBFES01+Wy71rxQPVjjfjK8fq45qT+1/mY/kte5G4YI='
+

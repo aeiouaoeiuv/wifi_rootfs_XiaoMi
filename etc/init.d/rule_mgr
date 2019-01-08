@@ -1,0 +1,103 @@
+#!/bin/sh /etc/rc.common
+
+START=98
+
+#export command line for /usr/sbin/supervisord
+LIP=`uci get network.lan.ipaddr 2>/dev/null`
+LMASK=`uci get network.lan.netmask 2>/dev/null`
+PRE_START="/usr/sbin/rule_mgr.sh start &>/dev/null"
+POST_STOP="/usr/sbin/rule_mgr.sh stop &>/dev/null"
+
+export PROCLINE="/usr/sbin/rule_mgr $LIP $LMASK"
+export PROCFLAG=$PROCLINE
+
+export EXTRA_HELP="	status	Status the service"
+export EXTRA_COMMANDS="status rule_mgr_enabled"
+
+service_name=" security cache ad_filter content_filter"
+
+rule_mgr_enabled(){
+    config_load "rule_mgr"
+    local switch
+    for name in $service_name
+    do
+        switch=`uci get rule_mgr.switch.${name}_center 2>/dev/null`
+        if [ $switch -eq "1" ]; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+start() {
+    config_load "rule_mgr"
+    #if no any service to let rule-mgr run, just exit.
+    rule_mgr_enabled
+    if [ $? -eq "0" ]; then
+        return 0
+    fi
+
+    local res
+    if [ -z $LIP -o -z $LMASK ]; then
+        echo "error: cannot get IP or mask,exit."
+        return 0
+    fi
+
+    status
+    if [ $? -eq "0" ]; then
+        echo "already running. exit."
+        return 0
+    fi
+
+    #ins mode
+    insmod nf_tcp_proxy >/dev/null 2>&1
+
+    sysctl -w net.ipv4.tcp_timestamps=0 >/dev/null 2>&1
+
+    # start to run
+    /usr/sbin/supervisord start
+    res=$?
+    if [ $res -ne "0" ]; then
+        return $res
+    fi
+    nohup $PRE_START >/dev/null 2>&1 &
+    return 0
+}
+
+restart() {
+	stop
+	sleep 1
+	start
+	return $?
+}
+
+shutdown() {
+	stop
+	return $?
+}
+
+stop() {
+    rule_mgr_enabled
+    if [ $? -eq "1" ]; then
+        echo "It will be in service for other clients. stop command ignored."
+        return 0
+    fi
+
+	/usr/sbin/supervisord stop
+    res=$?
+    if [ $res -ne "0" ]; then
+        return $res
+    fi
+    $POST_STOP
+
+    rmmod nf_tcp_proxy >/dev/null 2>&1
+	return $?
+}
+status() {
+	/usr/sbin/supervisord status
+	return $?
+}
+
+
+#

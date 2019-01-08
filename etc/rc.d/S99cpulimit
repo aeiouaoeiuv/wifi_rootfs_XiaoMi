@@ -1,0 +1,43 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=99
+
+#export command line for /usr/sbin/supervisord
+export PROCLINE="/usr/sbin/cpulimit_daemon.sh"
+#
+export PROCFLAG="/bin/sh /usr/sbin/cpulimit_daemon.sh"
+
+export EXTRA_HELP="     status  Status the service"
+export EXTRA_COMMANDS="status"
+
+start() {
+	if [ "$(uci get misc.initd.cpulimit_en 2>/dev/null)" != "1" ]
+	then
+		return 0
+	fi
+
+        /usr/sbin/supervisord start
+        return $?
+}
+
+restart() {
+        stop
+        sleep 1
+        start
+        return $?
+}
+
+shutdown() {
+        stop
+        return $?
+}
+
+stop() {
+        /usr/sbin/supervisord stop
+        return $?
+}
+status() {
+        /usr/sbin/supervisord status
+        return $?
+}

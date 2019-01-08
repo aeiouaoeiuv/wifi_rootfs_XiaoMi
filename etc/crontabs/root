@@ -1,0 +1,11 @@
+*/15 * * * * /usr/sbin/ntpsetclock 60 log >/dev/null 2>&1
+5 */8 * * * /usr/sbin/sec_clt.sh 600 >/dev/null 2>&1
+0 10,20 * * * /usr/sbin/crontab_record_camera.lua
+* * * * * /usr/sbin/startscene_crontab.lua `/bin/date "+%u %H:%M"`
+0 5 */1 * * /usr/sbin/ad_filter.sh 1800 >/dev/null 2>&1
+45 23 * * * /usr/sbin/points_sysset_pro.lua >/dev/null 2>&1
+*/1 * * * * /usr/sbin/wwdog
+0 20 * * * /usr/bin/stat_lan
+# brute force protected
+*/3 * * * * /usr/sbin/bfd -q
+*/2 * * * * /usr/sbin/trafficd_monitor >/dev/null 2>&1

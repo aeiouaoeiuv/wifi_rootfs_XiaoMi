@@ -1,0 +1,159 @@
+#! /bin/sh
+
+# help do swith PHY
+
+. /lib/functions.sh
+GREP='/bin/grep'
+cmd_stop_lan=
+cmd_start_lan=
+cmd_get_giga=
+reg_giga_on=
+cmd_get_100m=
+reg_100m_on=
+cmd_set_giga=
+reg_giga_on=
+reg_giga_off=
+cmd_set_100m=
+reg_100m_on=
+reg_100m_off=
+cmd_reneg=
+config_load misc
+config_get cmd_stop_lan switchop stop_lan
+config_get cmd_start_lan switchop start_lan
+config_get cmd_get_giga switchop get_wan_giga
+config_get reg_giga_on switchop reg_giga_on
+config_get reg_giga_off switchop reg_giga_off
+config_get cmd_get_100m switchop get_wan_100m
+config_get reg_100m_on switchop reg_100m_on
+config_get reg_100m_off switchop reg_100m_off
+config_get cmd_set_giga switchop set_wan_giga
+config_get cmd_set_100m switchop set_wan_100m
+config_get cmd_reneg switchop reneg_wan
+
+usage () {
+    echo "control phy swith"
+    echo "$0 start"
+    echo "$0 stop"
+    echo "$0 restart"
+    echo "$0 gwan - get wan speed"
+    echo "$0 swan [1000|100|10] - set wan speed"
+    exit 1
+}
+
+phy_stop_lan() {
+    [ -z "$cmd_stop_lan" ] && return 1
+    eval ${cmd_stop_lan}
+    return $?
+}
+
+phy_start_lan() {
+    [ -z "$cmd_start_lan" ] && return 1
+    eval ${cmd_start_lan}
+    return $?
+}
+
+# make client resend DHCP request
+phy_restart_lan() {
+    phy_stop_lan || return 1
+    sleep 3
+    phy_start_lan || return 1
+    return 0
+}
+
+phy_get_wan_speed() {
+    reg_giga=
+    if [ -n "$cmd_get_giga" ]; then
+	reg_giga=$(eval "$cmd_get_giga" | "$GREP" -i "$reg_giga_on")
+	if [ -n "$reg_giga" ]; then
+	    echo "1000Mb"
+	    return 0
+	fi
+    fi
+    reg_100m=
+    if [ -n "$cmd_get_100m" ]; then
+	reg_100m=$(eval "$cmd_get_100m" | "$GREP" -i "$reg_100m_on")
+	if [ -n "$reg_100m" ]; then
+	    echo "100Mb"
+	    return 0
+	else
+	    echo "10Mb"
+	    return 0
+	fi
+    fi
+    return 1
+}
+
+phy_set_wan_speed() {
+    [ -z "$1" ] && echo "set speed value!" && return 1
+    speed="$1"
+    shift
+    case "$speed" in
+	10)
+	    [ -z "$cmd_set_100m" ] && echo "unsupport 100M" && return 1
+	    eval "$cmd_set_100m" "$reg_100m_off"
+	    [ $? -eq 1 ] && return 1
+	    # in case there is giga
+	    [ -n "$cmd_set_giga" ] && {
+		eval "$cmd_set_giga" "$reg_giga_off"
+		[ $? -eq 1 ] && return 1
+	    }
+	    ;;
+	100)
+	    [ -z "$cmd_set_100m" ] && echo "unsupport 100M" && return 1
+	    eval "$cmd_set_100m" "$reg_100m_on"
+	    [ $? -eq 1 ] && return 1
+	    # in case there is giga
+	    [ -n "$cmd_set_giga" ] && {
+		eval "$cmd_set_giga" "$reg_giga_off"
+		[ $? -eq 1 ] && return 1
+	    }
+	    ;;
+	1000)
+	    [ -z "$cmd_set_giga" ] && echo "unsupport speed!" && return 1
+	    eval "$cmd_set_giga" "$reg_giga_on"
+	    [ $? -eq 1 ] && return 1
+	    # in case 100m was disabled
+	    [ -n "$cmd_set_100m" ] && eval "$cmd_set_100m" "$reg_100m_on"
+	    ;;
+	*)
+	    echo "unsupport speed!"
+	    return 1
+	    ;;
+    esac
+    # issue re-negotiat
+    [ -z "$cmd_reneg" ] && return 0
+    eval "$cmd_reneg"
+    if [ "$?" -eq 0 ]; then
+	# let phy do re-neg
+	[ -z "$1" ] && sleep 2
+	echo "set WAN speed to ${speed}Mb"
+	return 0
+    else
+	ehco 'renegotiation fail!'
+	return 1
+    fi
+}
+
+case "$1" in
+    stop)
+	phy_stop_lan
+    ;;
+    start)
+	phy_start_lan
+    ;;
+    restart)
+	phy_restart_lan
+        exit $?
+    ;;
+    gwan)
+	phy_get_wan_speed
+    ;;
+    swan)
+	shift
+	phy_set_wan_speed "$1"
+    ;;
+    *)
+	usage
+    ;;
+esac
+exit "$?"

@@ -1,0 +1,26 @@
+
+config mode
+	option wan 'blacklist'
+	option lan 'blacklist'
+	option admin 'blacklist'
+	option pridisk 'whitelist'
+
+config lanports
+
+config adminports
+	option tcp '80,443,23,22'
+
+config mac
+	option mac '2c:33:7a:6d:13:ab'
+	option wan 'yes'
+	option lan 'yes'
+	option admin 'yes'
+	option pridisk 'no'
+
+config mac
+	option mac 'c4:6a:b7:d5:bd:23'
+	option wan 'yes'
+	option lan 'yes'
+	option admin 'yes'
+	option pridisk 'no'
+

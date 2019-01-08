@@ -1,0 +1,13 @@
+
+config record 'online'
+	option c46ab7d5bd23 '1429494150'
+	option 2c337a6d13ab '1429497766'
+
+config record 'offline'
+	option c46ab7d5bd23 '1429436796'
+	option 2c337a6d13ab '1429495062'
+
+config record 'ifname'
+	option 2c337a6d13ab 'wl1'
+	option c46ab7d5bd23 'wl1'
+

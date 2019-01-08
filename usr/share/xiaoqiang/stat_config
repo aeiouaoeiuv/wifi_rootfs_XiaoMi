@@ -1,0 +1,5 @@
+
+config stat_config 'url'
+    option STAT_URL 'http://api.miwifi.com/action/v2/c/'
+	option ENCRYPT_URL 'http://api.miwifi.com/action/c/security/encrypt'
+	option CRASH_URL 'https://log.miwifi.com/log/crash/'

@@ -1,0 +1,9 @@
+
+config core 'history'
+	option 2C337A6D13AB '1'
+	option C46AB7D5BD23 '1'
+
+config record 'authfail'
+	option 2C337A6D13AB '0'
+	option C46AB7D5BD23 '0'
+

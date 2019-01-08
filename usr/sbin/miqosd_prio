@@ -1,0 +1,1748 @@
+#!/usr/bin/lua
+
+local px =  require "posix"
+local uci=  require 'luci.model.uci'
+local util = require 'luci.util'
+local io=   require 'io'
+local socket= require 'socket'
+local json= require 'json'
+local fs = require "nixio.fs"
+local ubus = require "ubus"
+
+local g_debug=false
+
+local g_CONFIG_HZ=100  -- R1CM
+
+--logger
+--[[1 Alert, 3 Error 7 Debug ]]--
+px.openlog("miqos","np",LOG_USER)
+function logger(loglevel,msg)
+    px.syslog(loglevel,msg)
+end
+
+--read args
+local QOS_VER='CTF'
+if #arg == 1 and arg[1] == 'std' then
+    logger(3, ' STD mode , arg: ' .. #arg)
+    QOS_VER='STD'
+else
+    logger(3, ' CTF mode , arg: ' .. #arg)
+    QOS_VER='CTF'
+end
+
+-------config status-----------
+local cfg_default_group,cfg_default_mode
+local cfg_changed = 'NONE'       -- cfg is changed by manual
+
+local g_default_min_updown_factor=0.5
+local const_total_max_grp_ratio=1.0
+local g_quantum_value=1600
+local g_idle_timeout=301     -- if not active in 301s, regard as dead
+local g_idle_timeout_wl=5    -- for wireless-point, if less then 5, regard it as dead
+
+local group_def={}
+local mode_def={}
+local class_def={}
+
+local cfg_host='127.0.0.1'
+local cfg_port='1035'
+
+local UP,DOWN='UP','DOWN'
+
+-------current status-----------
+local cur_bandwidth={UP=0,DOWN=0}
+local cfg_bandwidth={UP=0,DOWN=0}
+
+local cfg_qos_check_interval=15     --check interval in seconds
+local cur_qos_enabled, cfg_qos_enabled='0', '0'
+local g_alive_hosts={}         --current host list
+
+local g_crt_ipmac_map={} --维护当前tc的中的ip规则
+local g_nxt_ipmac_map={} --维护下一次tc的ip规则,在规则生效后,会copy给crt_ipmac表维护
+
+local QOS_AUTO='1'
+local g_f_init={UP=true,DOWN=true,ipt=true}      -- 表示是否需要重建规则框架
+
+local g_flow_type, g_num_of_clients
+local g_wan_if,g_lan_if
+local g_ifb,g_ifb_status='ifb0',DOWN
+local g_host_rate_factor=0.7
+local g_htb_buffer_factor=2
+
+-- 默认设置guest网络最大可以50%带宽，xq最大可以80%带宽
+local g_guest_default_band, g_xq_default_band= '0.5', '0.8'
+local g_cur_guest_max_band={UP=0,DOWN=0}
+local g_guest_max_band={UP=g_guest_default_band,DOWN=g_guest_default_band}
+local g_xq_max_band={UP=g_xq_default_band,DOWN=g_xq_default_band}
+
+local g_ubus
+local g_limit={}
+
+local QOS_ACK,QOS_SYN,QOS_FIN,QOS_RST,QOS_ICMP,QOS_Small
+
+local g_QOS_Status=0  -- 0 no qdisc, 1 only prio, 2 full stack
+local g_close_prio =0  -- prio qdisc is on as default
+
+-------constant string-----------
+local const_ipt_mangle="iptables -t mangle "
+local const_ipt_clear="iptables -t mangle -F "
+local const_ipt_delete="iptables -t mangle -X "
+local const_tc_qdisc="tc qdisc "
+local const_tc_class="tc class "
+local const_tc_filter="tc filter "
+local const_tc_dump=' tc -d class show dev %s |grep "level 6" '
+
+local IPT_CHAIN_ROOT="miqos0"
+local CHILD_IPT_CHAIN_ROOT="miqosc"
+local UNIT="kbit"
+
+local g_htb_parent_classid, g_xq_tbf_parent_classid, g_guest_tbf_parent_classid
+local g_htb_major_id={UP='',DOWN=''}
+local g_htb_parent={UP='',DOWN=''}
+
+local g_nomark={
+    id=0x2,
+    [UP]={rate=0.05, ceil=0.90, quan=1600, },
+    [DOWN]={rate=0.05, ceil=0.90, quan=1600, },
+    prio=7,
+}
+
+local g_host_rate={[UP] = 0, [DOWN] = 0 }
+local g_host_ceil={[UP] = 0, [DOWN] = 0 }
+
+local cfg_dir='/etc/config/'
+local tmp_cfg_dir='/tmp/etc/config/'
+local cfg_file=cfg_dir .. 'miqos'
+local tmp_cfg_file=tmp_cfg_dir .. 'miqos'
+local g_cursor
+
+-- 读取cfg到tmp的meory文件夹中
+function cfg2tmp()
+    local r1,r2,r3 = fs.mkdirr(tmp_cfg_dir)
+    if not r1 then
+        logger(3, 'fatal error: mkdir failed, code:' .. r2 .. ',msg:'..r3)
+        return nil
+    end
+
+    r1,r2,r3 = fs.copy(cfg_file,tmp_cfg_file)
+    if not r1 then
+        logger(3,'fatal error: copy cfg file 2 /tmp memory failed. code:' .. r2 .. ',msg:'..r3)
+        return nil
+    end
+    return true
+end
+
+-- 十进制转十六进制
+function dec2hexstr(d)
+    return string.format("%x",d)
+end
+
+-- 拷贝最新配置到memory中
+function tmp2cfg()
+    if not fs.copy(tmp_cfg_file,cfg_file) then
+        logger(3,'fatal error: copy /tmp cfg file 2 /etc/config/ failed. exit.')
+        return nil
+    end
+    return true
+end
+
+function copytab(st)
+    local tab={}
+    for k,v in pairs(st or {}) do
+        if type(v) ~= 'table' then tab[k]=v
+        else tab[k]=copytab(v) end
+    end
+    return tab
+end
+
+function get_conf_std(conf,type,opt,default)
+    local x=uci.cursor()
+    local s,e = pcall(function() return x:get(conf,type,opt) end)
+    return e or default
+end
+
+function get_tbls(conf,type)
+    local tbls={}
+    local s,e = pcall(function() g_cursor:foreach(conf, type, function(s) tbls[s['name']]=s end) end)
+    return tbls or {}
+end
+
+-- execute command without anyoutput
+function exec_cmd(tblist, ignore_error)
+    local status = 0
+    for _,v in pairs(tblist) do
+        local cmd = v
+
+        if g_debug then
+            logger(3, '++' .. cmd)
+        else
+            cmd = cmd .. " &>/dev/null "
+        end
+
+        if os.execute(cmd) ~= 0 and ignore_error ~= 1 then
+            logger(3, '[ERROR]:  ' .. cmd .. ' failed!')
+            dump_qdisc()
+            return false
+        end
+    end
+
+    return true
+end
+
+function newset()
+    local reverse = {}
+    local set = {}
+    return setmetatable(set, {__index = {
+        insert = function(set, value)
+            if not reverse[value] then
+                table.insert(set, value)
+                reverse[value] = table.getn(set)
+            end
+        end,
+        remove = function(set, value)
+            local index = reverse[value]
+            if index then
+                reverse[value] = nil
+                local top = table.remove(set)
+                if top ~= value then
+                    reverse[top] = index
+                    set[index] = top
+                end
+            end
+        end
+    }})
+end
+
+--split string with chars '$p'
+string.split = function(s, p)
+    local rt= {}
+    string.gsub(s, '[^'..p..']+', function(w) table.insert(rt, w) end )
+    return rt
+end
+
+function dump_qdisc()
+    local tblist={}
+    local expr=''
+    table.insert(tblist,'tc -d qdisc show | sort ')
+
+    local devs={'eth0.2','pppoe-wan','ifb0'}
+    for _,dev in pairs(devs) do
+        table.insert(tblist, 'tc -d class show dev ' .. dev .. ' | sort ')
+    end
+    for _,dev in pairs(devs) do
+        table.insert(tblist, 'tc filter show dev ' .. dev )
+        table.insert(tblist, 'tc filter show dev ' .. dev .. ' parent 10:')
+        table.insert(tblist, 'tc filter show dev ' .. dev .. ' parent 20:')
+    end
+    logger(3, '--------------miqos error dump START--------------------')
+    local pp,data
+    for _,cmd in pairs(tblist) do
+        pp=io.popen(cmd)
+        if pp then
+            for d in pp:lines() do
+                logger(3,d);
+            end
+        end
+    end
+    pp:close()
+    logger(3, '--------------miqos error dump END--------------------')
+end
+
+function host_ipt_cleanup()
+    -- only clear QOSC link rules
+    local expr=string.format(" %s -F %s ", const_ipt_mangle, CHILD_IPT_CHAIN_ROOT)
+    local tblist={}
+    table.insert(tblist,expr)
+    if not exec_cmd(tblist,1) then
+        logger(3, 'clean host ipt rules failed!')
+    end
+    g_f_init['ipt'] = true
+end
+
+function prio_root_qdisc_cleanup()
+    local tblist={}
+    local g_flow_type=update_flow_type()
+    local expr
+    for seq,flow_item in pairs(g_flow_type) do
+        expr=string.format(" %s del dev %s root ", const_tc_qdisc, flow_item['dev'])
+        table.insert(tblist,expr)
+        g_f_init[flow_item['direction']] = 1
+    end
+
+    if not exec_cmd(tblist,1) then logger(3, 'clean all qdisc rules failed!') end
+end
+
+-- 仅仅清除htb的qdisc规则,保留原prio规则在系统中
+function htb_root_qdisc_cleanup(direction, dev)
+    local tblist={}
+
+    local expr = string.format(" %s replace dev %s parent %s sfq perturb 10 ", const_tc_qdisc, dev, g_htb_parent[direction])
+    table.insert(tblist,expr)
+
+    if not exec_cmd(tblist,1) then logger(3, 'clean qdisc rules failed!') end
+
+    -- 后续需要重建框架
+    g_crt_ipmac_map = nil
+    g_f_init[direction] = true
+end
+
+function cleanup_htb()
+    local g_flow_type=update_flow_type()
+    for seq, flow_item in pairs(g_flow_type) do
+        local dir=flow_item['direction']
+        htb_root_qdisc_cleanup(dir,flow_item['dev'])
+        g_f_init[dir] = true
+    end
+end
+
+function cleanup_system()
+    prio_root_qdisc_cleanup()
+
+    host_ipt_cleanup()
+    logger(3,'======== QoS TC-PRIO OFF. ============')
+end
+
+function system_exit()
+    logger(3,'======== System Exit.  ============')
+    cleanup_system()
+    os.exit()
+end
+
+function system_init()
+    -- 将配置文件copy到tmp内存中,并初始化cursor
+    if not cfg2tmp() then
+        return false
+    end
+
+    g_cursor = uci.cursor()
+    if not g_cursor or not g_cursor:set_confdir(tmp_cfg_dir) then
+        logger(3,'set tmp config dir failed. exit.')
+    end
+
+    g_ubus = ubus.connect()
+    if not g_ubus then
+        logger(3, 'failed to connect to ubusd!')
+        return false
+    end
+
+    if not read_uci_conf() then
+        logger(3, 'read config failed, exit!')
+        return false
+    end
+
+    -- SIGTERM to clear and exit
+    px.signal(px.SIGTERM,
+        function ()
+            logger(3,'signal TERM to stop miqos.')
+            system_exit()
+        end)
+
+    px.signal(px.SIGINT,
+        function ()
+            logger(3,'signal INT to stop miqos.')
+            system_exit()
+        end)
+
+    -- 启动读取系统配置
+    read_sys_conf()
+
+    return true
+end
+
+-- 系统相关的配置文件
+function read_sys_conf()
+    g_lan_if=g_ifb
+
+    local tmp = get_conf_std('network','wan','proto')
+    if tmp == 'dhcp' or tmp == 'static' then
+        g_wan_if = 'eth0.2'
+    elseif tmp == 'pppoe' then
+        if QOS_VER == 'std' then
+            g_wan_if = 'pppoe-wan'
+        else
+            g_wan_if = 'eth0.2' -- CTF forward here directly, skip pppoe-wan
+        end
+    else
+        logger(1, 'cannot determine wan interface! exit')
+        return false
+    end
+
+    local config_tbl = get_tbls('miqos','system')
+    cfg_qos_check_interval=config_tbl['param']['interval'] or '5'
+    cfg_default_group=config_tbl['param']['default_group'] or '00'   -- 00 is default group
+    cfg_default_mode=config_tbl['param']['default_mode'] or 'general'
+
+    -- if check interval less than 3sec, will reset it to 3sec
+    if not cfg_qos_check_interval or tonumber(cfg_qos_check_interval) < 5 then
+        cfg_qos_check_interval = 5
+    else
+        cfg_qos_check_interval = tonumber(cfg_qos_check_interval)
+    end
+
+end
+
+-----------------------------------------------------------------------------
+-- read system configuration for each update
+-----------------------------------------------------------------------------
+function read_uci_conf()
+
+    local setting_tbl = get_tbls('miqos','miqos')
+
+    cfg_bandwidth[UP]=setting_tbl['settings']['upload'] or '0'
+    cfg_bandwidth[DOWN]=setting_tbl['settings']['download'] or '0'
+    cfg_qos_enabled=setting_tbl['settings']['enabled'] or '0'
+
+    QOS_ACK=setting_tbl['settings']['qos_ack'] or '0'
+    QOS_SYN=setting_tbl['settings']['qos_syn'] or '0'
+    QOS_FIN=setting_tbl['settings']['qos_fin'] or '0'
+    QOS_RST=setting_tbl['settings']['qos_rst'] or '0'
+    QOS_ICMP=setting_tbl['settings']['qos_icmp'] or '0'
+    QOS_Small=setting_tbl['settings']['qos_small'] or '0'
+    QOS_AUTO=setting_tbl['settings']['qos_auto'] or '1'
+
+    g_guest_max_band[UP],g_guest_max_band[DOWN] = get_guest_percent()
+    group_def=get_tbls('miqos','group')
+
+    -- 一组只含有一个MAC,同一个MAC可以对应多个IP
+    -- for k,v in pairs(group_def) do
+    --     for m,n in pairs(v['mac']) do
+    --         group_def[k]['mac'][m] = string.upper(n)
+    --     end
+    -- end
+
+    -- 自动模式设置组为group 00
+    if QOS_AUTO == '1' then
+        for k,v in pairs(group_def) do
+            if v['name'] ~= cfg_default_group then
+                group_def[k] = nil
+            end
+        end
+    end
+
+    mode_def=get_tbls('miqos','mode')
+    class_def=get_tbls('miqos','class')
+
+    return true
+end
+
+
+-----------------------------------------------------------------------------
+-- check if only need flush hosts rules or whole rules
+-----------------------------------------------------------------------------
+function check_changes()
+    local ret='C_NONE'
+    local update = update_host_list()
+
+    if update == 1 or cfg_changed == 'HOST' then
+        ret = 'C_HOST'
+    end
+
+    if cfg_changed == 'ALL' or cfg_qos_enabled ~= cur_qos_enabled or
+        tonumber(cfg_bandwidth[UP]) ~= cur_bandwidth[UP] or
+        tonumber(cfg_bandwidth[DOWN]) ~= cur_bandwidth[DOWN]
+    then
+        cur_bandwidth[UP] = tonumber(cfg_bandwidth[UP])
+        cur_bandwidth[DOWN] = tonumber(cfg_bandwidth[DOWN])
+        ret = 'C_ALL'
+    end
+
+    if g_guest_max_band[UP] ~= g_cur_guest_max_band[UP] or g_guest_max_band[DOWN] ~= g_cur_guest_max_band[DOWN] then
+        logger(3, '[FLUSH GUEST RULES] Uplink:' .. g_cur_guest_max_band[UP] .. '->' .. g_guest_max_band[UP] .. ', Downlink:' .. g_cur_guest_max_band[DOWN] .. '->' .. g_guest_max_band[DOWN])
+        g_cur_guest_max_band[UP] = g_guest_max_band[UP]
+        g_cur_guest_max_band[DOWN] = g_guest_max_band[DOWN]
+        ret = 'C_ALL'
+    end
+
+    if ret == 'C_ALL' then
+        logger(3, "[FLUSH ALL RULES] Uplink: " .. cur_bandwidth[UP] .. ", Downlink: " .. cur_bandwidth[DOWN] .. ", Clients: " .. g_num_of_clients)
+    elseif ret == 'C_HOST' then
+        logger(3, "[FLUSH HOST RULES] Uplink: " .. cur_bandwidth[UP] .. ", Downlink: " .. cur_bandwidth[DOWN] .. ", Clients: " .. g_num_of_clients)
+    else
+        -- logger(3, '[No FLUSH RULES]')
+    end
+
+    cfg_changed = 'NONE'
+
+    return ret
+end
+
+-----------------------------------------------------------------------------
+-- update actived host list
+-- 如果新的ip和mac跟已存的信息不一致的情况,则清除原来的ip和mac对应的规则,然后新建规则
+-----------------------------------------------------------------------------
+function update_host_list()
+
+    local host_changed=0
+
+    g_nxt_ipmac_map = {}
+    g_num_of_clients = 0
+    g_alive_hosts={}
+
+    -- 获取active的mac和ip信息
+    local ret=g_ubus:call("trafficd", "hw", {})
+    -- step1.更新nxt ipmac表
+    for mac,v in pairs(ret or {}) do
+        local mac = v['hw']
+        local wifi = '0'
+        if v['ifname'] == "wl0" or v['ifname'] == "wl1" then
+            wifi = '1'  -- host wifi
+        elseif string.find(v['ifname'],"wl",1) then
+            wifi = '2'   -- guest wifi, will be skipped later
+        end
+        -- 遍历此mac下所有ip地址
+        for k,ips in pairs(v['ip_list'] or {}) do
+            -- 检查ip地址的在线状态by ageingtime
+            local valid_ip = false
+            if wifi == '1' then
+                if v['assoc'] == 1 and ips['ageing_timer'] < g_idle_timeout then
+                    valid_ip = true
+                end
+            elseif wifi == '0' then
+                if ips['ageing_timer'] < g_idle_timeout then
+                    valid_ip = true
+                end
+            end
+
+            local ip = ips['ip']
+            local nid=string.split(ip,'.')[4]
+            -- 局点有效,首先置此ip为NEW
+            if valid_ip and nid then
+                -- 维护队列,以ip为key
+                g_nxt_ipmac_map[ip]={
+                    mac=mac,
+                    st='S_NEW',
+                    id=nid,
+                    idle=ips['ageing_timer'],
+                }
+                g_num_of_clients = g_num_of_clients + 1
+
+                if not g_alive_hosts[mac] then
+                    g_alive_hosts[mac] = {}
+                end
+
+                -- mac + ip 表示一个有效的host
+                g_alive_hosts[mac][ip] = 1
+                -- logger(3,"mac: " .. mac .. ',ip: ' .. ip)
+            end
+        end
+    end
+
+    -- step2.根据crt ipmac表 和 nxt ipmac表,设置nxt表中需更新的IP状态记录
+    for iip,imac in pairs(g_nxt_ipmac_map or {}) do
+        if g_crt_ipmac_map and g_crt_ipmac_map[iip] then
+            -- 此IP规则需要更新
+            g_nxt_ipmac_map[iip]['st']='S_UPD'
+
+            -- IP未变,但是对应的MAC变化了,则需要刷新
+            if g_crt_ipmac_map[iip]['mac'] ~= imac['mac'] then
+                host_changed = 1
+                logger(3,'ip-mac mapping changed ' .. iip .. '<>' .. g_crt_ipmac_map[iip]['mac'] .. '/'.. imac['mac'] ..' triggered fresh')
+            end
+        else
+            -- 新加入的IP,需要刷新
+            host_changed = 1
+            logger(3,'new ip ' .. iip ..' triggered fresh')
+        end
+    end
+
+    -- step3.根据crt ipmac表 和 nxt ipmac表,设置crt表中需要删除的IP状态记录
+    for iip,imac in pairs(g_crt_ipmac_map or {}) do
+        if g_nxt_ipmac_map[iip] then
+            g_crt_ipmac_map[iip]['st']='S_NONE'
+        else
+            -- [分类2].有客户端过期,需要刷新客户端规则
+            logger(3,'need remove expired Host' .. iip)
+            g_crt_ipmac_map[iip]['st']='S_DEL'
+            host_changed = 1
+            logger(3,'removed ip ' .. iip ..' triggered fresh')
+        end
+    end
+
+    return host_changed
+end
+
+
+-----------------------------------------------------------------------------
+-- arrange bandwidth for each group
+-- return percetage occupied %
+-----------------------------------------------------------------------------
+function arrange_bandwidth()
+
+    local host_counter_with_cfg = 0
+    local host_counter_without_cfg = 0
+
+    -- calculate total quantums of rate
+    local total_quantum_up=0.0
+    local total_quantum_down=0.0
+    for k,v in pairs(g_alive_hosts) do
+        local host_counter_this_mac = 0
+        for _,_ in pairs(v) do
+            host_counter_this_mac = host_counter_this_mac + 1
+        end
+        logger(3,'alive host number of mac [' .. k .. '] : ' .. host_counter_this_mac)
+
+        local group_id
+        if not group_def[k] then
+            group_id = cfg_default_group   -- 无配置,则设定为默认分组
+            host_counter_without_cfg = host_counter_without_cfg + host_counter_this_mac
+        else
+            group_id = k
+            group_def[k]['count'] = host_counter_this_mac
+            host_counter_with_cfg = host_counter_with_cfg + host_counter_this_mac
+        end
+
+        local tmp_num = tonumber(group_def[group_id]['min_grp_uplink'])
+        if tmp_num <=0 or tmp_num > 1 then
+            group_def[group_id]['min_grp_uplink'] = g_default_min_updown_factor
+            tmp_num = tonumber(g_default_min_updown_factor)
+        end
+        total_quantum_up = total_quantum_up + tmp_num * host_counter_this_mac
+
+        tmp_num = tonumber(group_def[group_id]['min_grp_downlink'])
+        if  tmp_num <= 0 or tmp_num > 1 then
+            group_def[group_id]['min_grp_downlink'] = g_default_min_updown_factor
+            tmp_num = tonumber(g_default_min_updown_factor)
+        end
+        total_quantum_down = total_quantum_down + tmp_num * host_counter_this_mac
+
+    end
+
+    group_def[cfg_default_group]['count'] = host_counter_without_cfg
+
+    for k,v in pairs(group_def) do
+        if v['count'] and tonumber(v['count']) > 0 then
+
+            --minimum assured rate
+            if not v['min_grp_uplink'] or v['min_grp_uplink'] == '0' then
+                v['min_grp_uplink'] = g_default_min_updown_factor
+            end
+            group_def[k]['each_up_rate'] = v['min_grp_uplink'] / total_quantum_up
+
+            if not v['min_grp_downlink'] or v['min_grp_downlink'] == '0' then
+                v['min_grp_downlink'] = g_default_min_updown_factor
+            end
+            group_def[k]['each_down_rate'] =  v['min_grp_downlink'] / total_quantum_down
+
+            --maximum ceil rate
+            if not v['max_grp_uplink'] or  v['max_grp_uplink'] == '0' then
+                v['max_grp_uplink'] = 1
+            end
+            group_def[k]['each_up_ceil'] = v['max_grp_uplink'] / const_total_max_grp_ratio
+
+            if not v['max_grp_downlink'] or  v['max_grp_downlink'] == '0' then
+                v['max_grp_downlink'] = 1
+            end
+            group_def[k]['each_down_ceil'] =  v['max_grp_downlink'] / const_total_max_grp_ratio
+
+            logger(3, '@mac:' .. k .. ',count:' .. v['count'] .. ',min_up:' .. v['each_up_rate'] .. ',min_down:' .. v['each_down_rate'] .. ',max_up:' .. v['each_up_ceil'] .. ',max_down:' .. v['each_down_ceil'])
+        end
+    end
+
+    return host_counter_with_cfg + host_counter_without_cfg
+end
+
+-----------------------------------------------------------------------------
+-- iptables mark packages by ports/tos
+-----------------------------------------------------------------------------
+function ipt_mark_hosts_nf()
+
+    local expr=''
+    local tblist={}
+    -- by design, only support default mode
+    local host_mode= mode_def[cfg_default_mode]
+    local tcp_posts,udp_ports,tos
+
+    for m=1, #(host_mode['subclass']) do
+        local cls = class_def[host_mode['subclass'][m]]
+        if cls then
+            local as_default = 1
+            tcp_ports=cls['tcp_ports']
+            udp_ports=cls['udp_ports']
+            tos=cls['tos']
+            if tcp_ports and tcp_ports ~= '' then
+                expr = string.format(" %s -A %s -m mark --mark 0/0x00f00000 -p tcp -m multiport --ports %s -j MARK --set-mark-return 0x%s00000/0x00f00000 ", const_ipt_mangle, CHILD_IPT_CHAIN_ROOT, tcp_ports, m)
+                table.insert(tblist,expr)
+                as_default = 0
+            end
+
+            if udp_ports and udp_ports ~= '' then
+                expr = string.format(" %s -A %s -m mark --mark 0/0x00f00000 -p udp -m multiport --ports %s -j MARK --set-mark-return 0x%s00000/0x00f00000 ", const_ipt_mangle, CHILD_IPT_CHAIN_ROOT, udp_ports, m)
+                table.insert(tblist,expr)
+                as_default = 0
+            end
+
+            if tos and tos ~= '' then
+                expr = string.format(" %s -A %s -m mark --mark 0/0x00f00000 -m tos --tos %s -j MARK --set-mark-return 0x%s00000/0x00f00000 ", const_ipt_mangle, CHILD_IPT_CHAIN_ROOT, tos, m)
+                table.insert(tblist,expr)
+                as_default = 0
+            end
+
+            if as_default ~= 0 then
+                expr = string.format(" %s -A %s -m mark --mark 0/0x00f00000 -j MARK --set-mark-return 0x%s00000/0x00f00000 ", const_ipt_mangle, CHILD_IPT_CHAIN_ROOT, m)
+                table.insert(tblist,expr)
+            end
+        end
+    end
+
+    if not exec_cmd(tblist,nil) then
+        logger(3,'ERROR: ipt mark hosts nf failed.')
+        return false
+    end
+    return true
+end
+
+-----------------------------------------------------------------------------
+-- generate special filters for highest priority,
+-- including :
+-- 1. ACK/SYN/FIN 1stly
+-- 2. length < 64 bytes (little package)
+-----------------------------------------------------------------------------
+function tc_add_special_filter(tblist, dev, flow_id, dir, high_class_id, priority)
+    local expr=''
+    local highest_class_handle = high_class_id
+
+    if QOS_ACK == '1' then
+        expr=string.format(" %s add dev %s parent %s: prio %s protocol ip u32 match ip protocol 6 0xff match u8 0x05 0x0f at 0 match u16 0x0000 0xffc0 at 2 match u8 0x10 0xff at 33 flowid %s:%s ", const_tc_filter, dev, flow_id, priority, flow_id, highest_class_handle)
+        table.insert(tblist,expr)
+    end
+
+    if QOS_SYN == '1' then
+        expr=string.format(" %s add dev %s parent %s: prio %s protocol ip u32 match ip protocol 6 0xff match u8 0x05 0x0f at 0 match u16 0x0000 0xffc0 at 2 match u8 0x02 0x02 at 33 flowid %s:%s ", const_tc_filter, dev, flow_id, priority, flow_id, highest_class_handle)
+        table.insert(tblist,expr)
+    end
+
+    if QOS_FIN == '1' then
+        expr=string.format(" %s add dev %s parent %s: prio %s protocol ip u32 match ip protocol 6 0xff match u8 0x05 0x0f at 0 match u16 0x0000 0xffc0 at 2 match u8 0x01 0x01 at 33 flowid %s:%s ", const_tc_filter, dev, flow_id, priority, flow_id, highest_class_handle)
+        table.insert(tblist,expr)
+    end
+
+    if QOS_RST == '1' then
+        expr=string.format(" %s add dev %s parent %s: prio %s protocol ip u32 match ip protocol 6 0xff match u8 0x05 0x0f at 0 match u16 0x0000 0xffc0 at 2 match u8 0x04 0x04 at 33 flowid %s:%s ", const_tc_filter, dev, flow_id, priority, flow_id, highest_class_handle)
+        table.insert(tblist,expr)
+    end
+
+    if QOS_ICMP == '1' then
+        expr=string.format(" %s add dev %s parent %s: prio %s protocol ip u32 match ip protocol 1 0xff flowid %s:%s ",  const_tc_filter, dev, flow_id, priority, flow_id, highest_class_handle)
+        table.insert(tblist,expr)
+    end
+
+    -- small packakages if length <  64 bytes for tcp
+    if QOS_Small == '1' then
+        local mask = '0xffc0'
+
+        expr=string.format(" %s add dev %s parent %s: prio %s protocol ip u32 match ip protocol 6 0xff match u16 0x0000 %s at 2 flowid %s:%s ", const_tc_filter, dev, flow_id, priority, mask, flow_id,  highest_class_handle)
+        table.insert(tblist,expr)
+    end
+
+    return true
+end
+
+function tc_add_sfq_rule(tblist,dev, flow_id, p_class_id)
+    local expr=string.format("%s replace dev %s parent %s:%s sfq perturb 10 ",const_tc_qdisc, dev, flow_id, p_class_id)
+    table.insert(tblist,expr)
+end
+
+-- 默认开启tc prio队列,保留band2 作为host-net的qdisc根
+function tc_fixed_prio_root_qdisc_class_filters(dev, flow_id, act, ratelimit, direction)
+    local tblist={}
+    local expr=''
+    local parent='1'
+
+    if act == 'add' then
+        expr=string.format(" %s %s dev %s root handle %s: prio bands 5 priomap 2 3 3 3 2 3 1 1 2 2 2 2 2 2 2 2 ", const_tc_qdisc, act, dev, flow_id)
+        table.insert(tblist,expr)
+        -- band 1/2/3/4/5 class queue = pfifo as default, 后续band2可以替换为其他qdisc
+
+        -- band 1 分类,app通信通道 0x00010000/0x000f0000
+        local self_class_id = '1'
+        expr=string.format(" %s %s dev %s parent %s: prio 1 handle 0x00010000/0x000f0000 fw classid %s:%s", const_tc_filter, act, dev, flow_id, flow_id, self_class_id)
+        table.insert(tblist,expr)
+        tc_add_sfq_rule(tblist,dev,flow_id,self_class_id)
+
+        -- band 2 分类, syn,rst,est,small etc 高级优先级通道
+        self_class_id = '2'
+        tc_add_special_filter(tblist, dev, flow_id, direction, self_class_id, '2')
+        tc_add_sfq_rule(tblist,dev,flow_id,self_class_id)
+
+        -- band 3 分类, host 分类
+        self_class_id = '3'   --流分类字节标识 0x00030000/0x000f0000
+        expr=string.format(" %s %s dev %s parent %s: prio 1 handle 0x00030000/0x000f0000 fw classid %s:%s", const_tc_filter, act, dev, flow_id, flow_id, self_class_id)
+        table.insert(tblist,expr)
+        g_htb_parent_classid = self_class_id
+
+        -- band 4 分类,guest-network 优先级, 0x00e00000/0x00f00000
+        self_class_id = '4'   -- 流分类字节标识 0x00040000/0x000f0000
+        expr=string.format(" %s %s dev %s parent %s: prio 1 handle 0x00040000/0x000f0000 fw classid %s:%s", const_tc_filter, act, dev, flow_id, flow_id, self_class_id)
+        table.insert(tblist,expr)
+        g_guest_tbf_parent_classid = self_class_id
+
+        -- band 5 分类,XQ Xulei/KuaiPan and other packets not recongnized, priority 10
+        self_class_id = '5'
+        expr=string.format(" %s %s dev %s parent %s: prio 5 handle 0x01000000/0xff000000 fw classid %s:%s", const_tc_filter, act, dev, flow_id, flow_id, self_class_id)
+        g_xq_tbf_parent_classid = self_class_id
+        table.insert(tblist,expr)
+
+    end
+
+    if act == 'add' or act == 'change' then
+        local tbf_act = 'replace'
+        local max_rate
+        local buffer_burst
+        -- band5 类，增加一个tbf限速策略，最高速度限速为band的80%
+        if tonumber(ratelimit) > 10 then
+
+            -- guest wifi max bandwidth
+            max_rate = tonumber(ratelimit)*g_guest_max_band[direction]
+            buffer_burst=math.ceil(max_rate*1024/g_CONFIG_HZ)
+            if buffer_burst < 2000 then buffer_burst = 2000 end
+            expr=string.format(" %s %s dev %s parent %s:%s handle %s1: tbf rate %s%s buffer %s latency 50ms", const_tc_qdisc, tbf_act, dev, flow_id, g_guest_tbf_parent_classid, flow_id, max_rate, UNIT, buffer_burst)
+            table.insert(tblist,expr)
+
+            -- xiaoqiang pkt flow max bandwidth
+            max_rate = tonumber(ratelimit)*g_xq_max_band[direction]
+            buffer_burst=math.ceil(max_rate*1024/g_CONFIG_HZ)
+            if buffer_burst < 2000 then buffer_burst = 2000 end
+            expr=string.format(" %s %s dev %s parent %s:%s handle %s2: tbf rate %s%s buffer %s latency 10ms", const_tc_qdisc, tbf_act, dev, flow_id, g_xq_tbf_parent_classid, flow_id, max_rate, UNIT, buffer_burst)
+            table.insert(tblist,expr)
+        end
+    end
+
+    if not exec_cmd(tblist,nil) then
+        logger(3,'ERROR: add root tc-prio qdisc rules failed.')
+        system_exit()
+        -- exit system when fatal error
+    end
+    return true
+end
+
+-----------------------------------------------------------------------------
+-- generate root qdisc/class/filter
+-- 配置host-network的顶层htb设计,在用户ON了QoS之后 (支持add/change)
+-----------------------------------------------------------------------------
+function tc_fixed_htb_root_qdisc_class_filters(dev, flow_id, parent_class_id, rate, direction, act)
+
+    local tblist={}
+    local expr=''
+    local root_major_id= flow_id .. '0'      -- 顶层handle
+    local root_minor_id = '1'
+    local nomark_class_id = dec2hexstr(g_nomark['id'])
+
+    if g_debug then
+        if act == 'add' then logger(3, 'new add qdisc top arch.')
+        elseif act == 'change' then logger(3, 'update change qdisc top arch.')
+        else
+            logger(3, 'r u sure such action ' .. act .. ' is correct ?')
+            return false
+        end
+    end
+
+    -- 仅仅在add的时候设定顶层htb qdisc
+    if act == 'add' then
+        local parent_handle=flow_id .. ':' .. parent_class_id
+        local qdisc_act = 'replace'
+        expr = string.format(" %s %s dev %s parent %s handle %s: htb default 2 ", const_tc_qdisc, qdisc_act, dev, parent_handle, root_major_id)
+        table.insert(tblist,expr)
+
+        -- 保存major id
+        g_htb_major_id[direction]=root_major_id
+        g_htb_parent[direction]=parent_handle
+    end
+
+    -- htb 根class
+    local buffer=math.ceil(tonumber(rate)*1024/8.0/g_CONFIG_HZ*g_htb_buffer_factor)
+    expr = string.format(" %s %s dev %s parent %s: classid %s:%s htb rate %s%s burst %d cburst %d ", const_tc_class, act, dev, root_major_id, root_major_id, root_minor_id, rate, UNIT, buffer, buffer)
+    table.insert(tblist, expr)
+    logger(3,'<root-' .. direction .. '>,A:' .. act .. ',R:' .. rate .. '~C:' .. rate )
+
+    local lrate, lceil = rate * g_nomark[direction]['rate'], rate * g_nomark[direction]['ceil']
+
+    -- no mark 子类
+    buffer=math.ceil(tonumber(lceil)*1024/8.0/g_CONFIG_HZ*g_htb_buffer_factor)
+    expr = string.format(" %s %s dev %s parent %s:%s classid %s:%s htb rate %s%s ceil %s%s prio %s quantum %s burst %d cburst %d ", const_tc_class, act, dev, root_major_id, root_minor_id, root_major_id, nomark_class_id, lrate, UNIT, lceil, UNIT, g_nomark['prio'], g_nomark[direction]['quan'], buffer, buffer)
+    table.insert(tblist, expr)
+
+    if not exec_cmd(tblist,nil) then
+        logger(3,'ERROR: add root qdisc rules failed.')
+        return false
+    end
+
+    return true
+end
+
+-----------------------------------------------------------------------------
+--  更新host的htb节点树, host_base_id 为每个单独host的根id
+-----------------------------------------------------------------------------
+function tc_update_htb_hosts_qdisc_class_filter(act, host_base_id, host_mode, dev, major_id,rate, ceil, quantum)
+
+    local tblist={}
+    local expr=''
+
+    local host_base_num = host_base_id                               -- 个体host的根
+    local host_root_id = dec2hexstr(host_base_num)
+
+    -- 个体host的根root-class, ID: major_id:major_id
+    local buffer = math.ceil(tonumber(ceil)*1024/8.0/g_CONFIG_HZ*g_htb_buffer_factor)
+    if act == 'del' then
+        -- expr = string.format(" %s %s dev %s parent %s:%s classid %s:%s ", const_tc_class, act, dev, major_id, major_id, major_id, host_root_id)
+        expr = string.format(" %s %s dev %s classid %s:%s ", const_tc_class, act, dev, major_id, host_root_id)
+        table.insert(tblist,1,expr)    -- insert from backend
+    elseif act == 'change' then
+        expr = string.format(" %s %s dev %s parent %s:1 classid %s:%s htb rate %s%s ceil %s%s burst %d cburst %d ", const_tc_class, act, dev, major_id, major_id, host_root_id, rate, UNIT, ceil, UNIT, buffer, buffer)
+        table.insert(tblist,1,expr)    -- change from leaf-node
+    else
+        expr = string.format(" %s %s dev %s parent %s:1 classid %s:%s htb rate %s%s ceil %s%s burst %d cburst %d ", const_tc_class, act, dev, major_id, major_id, host_root_id, rate, UNIT, ceil, UNIT, buffer, buffer)
+        table.insert(tblist,expr)  -- add
+    end
+
+    -- 个体host的流分类叶节点（包含最底层的sfq叶子）
+    local last_handle
+    local nSubs=#(host_mode['subclass'])
+    for m=1, nSubs do
+        local cls = class_def[host_mode['subclass'][m]]
+
+        if not cls and ( not cls['rate'] or not cls['ceil'] ) then
+            logger(3, 'CLS' .. mode['subclass'][m] .. ' is not defined or rate/ceil not set, exit!')
+            return false
+        end
+
+        -- 个体的流分类队列
+        local lclassid = dec2hexstr(host_base_num + m)
+
+        -- htb的优先级必须在[1,7]之间
+        local htb_prio = m
+
+        if htb_prio > 7 then htb_prio = 7 end
+
+        if act == 'del' then
+            -- expr = string.format(" %s %s dev %s parent %s:%s classid %s:%s ", const_tc_class, act, dev, major_id, host_root_id, major_id, lclassid)
+            expr = string.format(" %s %s dev %s classid %s:%s ", const_tc_class, act, dev, major_id, lclassid)
+            table.insert(tblist, 1, expr)
+        else
+            local lrate = rate * cls['rate']
+            local lceil = ceil * cls['ceil']
+            -- logger(3, '     CLS ' .. m .. ': ' .. lrate .. '-' .. lceil .. ',P' .. htb_prio ..  ',burst:' .. lburst)
+
+            -- 流分类节点
+            local buffer = math.ceil(tonumber(lceil)*1024/8.0/g_CONFIG_HZ*g_htb_buffer_factor)
+            expr = string.format(" %s %s dev %s parent %s:%s classid %s:%s htb rate %s%s ceil %s%s prio %s  quantum %s burst %d cburst %d ", const_tc_class, act, dev, major_id, host_root_id, major_id, lclassid, lrate, UNIT, lceil, UNIT, htb_prio, quantum, buffer, buffer)
+            if act == 'change' then
+                table.insert(tblist,1,expr)
+            else
+                table.insert(tblist, expr)
+            end
+        end
+
+        -- filter with fwmark 流分类filter $$ filter prio can be [1,N)
+        -- 这里需要注意,fw的prio与1级filter有关系,同一prio拥有相同的filter,且相同的mask
+        -- 所以0xfff00000的priority是2,0xff000000的prio是3,只分3个优先级
+        expr = string.format(" %s %s dev %s parent %s: prio 2 handle 0x%s00000/0xff700000 fw classid %s:%s ", const_tc_filter, act, dev, major_id , lclassid, major_id, lclassid)
+        if act == 'del' then
+            table.insert(tblist, 1, expr)
+        elseif act == 'change' then
+            -- filter is not changed.
+        else
+            table.insert(tblist,expr)
+        end
+
+        -- sfq leaf qdisc SFQ叶子节点,自动分类ID
+        expr = string.format(" %s %s dev %s parent %s:%s sfq perturb 10 ", const_tc_qdisc, act, dev, major_id, lclassid)
+        if act == 'del' then
+            table.insert(tblist, 1, expr)
+        elseif act == 'change' then
+            -- no change for sfq
+        else
+            table.insert(tblist, expr)
+        end
+
+        last_handle = lclassid
+    end
+
+    --default filter
+    expr = string.format(" %s %s dev %s parent %s:  prio 3 handle 0x%s00000/0xff000000 fw classid %s:%s ", const_tc_filter, act, dev, major_id, host_root_id, major_id, last_handle)
+    if act == 'del' then
+        table.insert(tblist, 1, expr)
+    elseif act == 'change' then
+        -- no change for filter
+    else
+        table.insert(tblist,expr)
+    end
+
+    if not exec_cmd(tblist,nil) then
+        logger(3,'update [' .. act .. '] host_root_id ' .. host_root_id .. ' failed.')
+        return false
+    end
+
+    return true
+end
+
+-- refresh qos for all hosts, including up/down
+function refresh_all_hosts_qos(dev_name, direction, root_id, rate_host, ceil_host)
+
+    -- 当前仅仅支持一种mode格式
+    local mode=mode_def[cfg_default_mode]
+    local act
+
+    -- step1.删除需要删除的IP记录
+    act = 'del'
+    for ip,v in pairs(g_crt_ipmac_map or {}) do
+        -- logger(3,'loop g_crt_ipmac_map,'..v['mac']..','..ip)
+        if v['st'] == 'S_DEL' then
+            logger(3,'clear MAC ' .. v['mac'] .. ', IP ' .. ip)
+            local host_base_id = tonumber(v['id'])*0x10
+
+            -- 删除过期的S_DEL 记录
+            if not tc_update_htb_hosts_qdisc_class_filter(act, host_base_id, mode,dev_name,root_id, 0,0,0) then
+                return false
+            end
+        end
+    end
+
+    -- step2.新增或更新的IP记录,以IP为KEY
+    for ip,v in pairs(g_nxt_ipmac_map or {}) do
+        local host_act = v['st']
+        -- 如果根框架未定,则强制新建 S_NEW
+        if g_f_init[direction] then
+            host_act = 'S_NEW'
+        end
+
+        if host_act == 'S_NEW' then act = 'add'
+        elseif host_act == 'S_UPD' then act = 'change'
+        else act = 'del'end
+
+        local mac = v['mac']
+        if not g_alive_hosts[mac] then
+            logger(3,'exception case')
+            return false
+        end
+
+        -- 获取此IP对应的设置参数
+        local ip_group = group_def[mac] or group_def[cfg_default_group]
+
+        local lhost_rate,lhost_ceil = 0,0
+
+        if direction == UP then
+            if ip_group['each_up_rate'] > 0 then lhost_rate = ip_group['each_up_rate'] end
+            if ip_group['each_up_ceil'] > 0 then lhost_ceil = ip_group['each_up_ceil'] end
+        else
+            if ip_group['each_down_rate'] > 0 then lhost_rate = ip_group['each_down_rate'] end
+            if ip_group['each_down_ceil'] > 0 then lhost_ceil = ip_group['each_down_ceil'] end
+        end
+
+        local in_ceil = math.ceil(lhost_ceil * ceil_host)
+        local in_rate = math.ceil(lhost_rate * rate_host)
+        local ratio = ip_group['min_grp_uplink']*10
+        if ratio <= 0 then ratio =1 end
+        if ratio > 10 then ratio =10 end
+        local in_quan = math.ceil(g_quantum_value * ratio)
+
+        if in_ceil < 10 then in_ceil = 10 end
+        if in_rate > in_ceil then in_rate = in_ceil end
+        if in_rate < 10 then in_rate = 10 end
+
+        logger(3, ' **MAC ' .. mac .. ",IP " .. ip .. ', ' .. direction .. ',' .. in_rate .. '-' .. in_ceil .. ', id:' .. v['id'] .. ',action:' .. host_act)
+
+        --new tc class for host
+        local host_base_id = tonumber(v['id'])*0x10
+        if not tc_update_htb_hosts_qdisc_class_filter(act, host_base_id, mode, dev_name, root_id, in_rate, in_ceil, in_quan) then
+            return false
+        end
+    end
+
+    return true
+end
+
+function update_flow_type()
+    local flow_type={
+        {root= '1', dev = g_ifb, direction = DOWN, },
+        {root= '2', dev = g_wan_if, direction = UP, },
+    }
+
+    return flow_type
+end
+
+-----------------------------------------------------------------------------
+-- 分类定义
+-- 每一层class id的定义规则
+-- 第1层, 顶层 class: x:1  (均为16进制)
+-- 第2层, 分客户端顶层类 x:10, x:20, x:30 ....... x:ff0
+-- 第3层, 分客户端的下层流分类 分别为 x:11 x:12 ... x:1f,  x:21 x:22...x:2f, .....x:ff1 x:ff2 ...x:fff
+-- 其他层, 自动分类
+-----------------------------------------------------------------------------
+--  Update QOS rule and IPT mark
+-----------------------------------------------------------------------------
+function flush_qos_rules()
+
+    local devName,expr,C_type
+
+    C_type = check_changes()
+    if C_type == 'C_NONE' then
+        return true
+    elseif C_type == 'C_ALL' then   -- 先清除htb规则
+        flush_prio_qos(true)  -- 更新tbf规则
+        if g_f_init[UP] then
+            logger(3,'++++clean UP root qdisc.')
+            htb_root_qdisc_cleanup(UP,g_wan_if)
+        end
+
+        if g_f_init[DOWN] then
+            logger(3,'++++clean DOWN root qdisc.')
+            htb_root_qdisc_cleanup(DOWN,g_lan_if)
+        end
+
+        if g_f_init['ipt'] then
+            logger(3,'++++set IPT root rules.')
+            ipt_mark_hosts_nf()
+            g_f_init['ipt'] = false
+        end
+
+    elseif C_type == 'C_HOST' then
+        -- only flush host rules
+    else
+        logger(3, 'not supported operation.')
+        return false
+    end
+
+
+    -- 为每个host分配顶层带宽
+    local host_counter_in_total = arrange_bandwidth()
+
+    -- 为upload和download方向生成规则
+    for seq,flow_item in pairs(g_flow_type) do
+        if not flow_item['root'] or not flow_item['dev'] or not flow_item['direction']then
+            logger(3, 'parameter root/dev/direct is not provisioned')
+            return false
+        end
+
+        local flow_id,dev_name,direction = flow_item['root'],flow_item['dev'],flow_item['direction']
+
+        -- 初始化的情况下设置act为add,其他为change
+        local act = 'change'
+        if g_f_init[direction] then act = 'add' end
+
+        -- 设置htb的最大带宽
+        local total_width = cur_bandwidth[direction]
+
+        -- 如果rate == 0,不设置此方向上的qdisc
+        if total_width <= 0 then
+            -- clear such direction's rules
+            htb_root_qdisc_cleanup(direction, flow_item['dev'])
+            logger(3,'clear [' .. direction .. '] qos rules as bandwidth is 0.')
+        else
+            if C_type == 'C_ALL' or g_f_init[direction] then
+
+                -- add tc fixed htb root rules
+                if tc_fixed_htb_root_qdisc_class_filters(dev_name, flow_id,g_htb_parent_classid,total_width, direction, act) then
+                    -- add host rules
+                    if not refresh_all_hosts_qos(dev_name, direction, g_htb_major_id[direction], total_width*g_host_rate_factor, total_width ) then
+                        return false
+                    end
+                    g_f_init[direction] = false    -- 在框架建立之后置标志false
+                else
+                    g_f_init[direction] = true
+                end
+            elseif C_type == 'C_HOST' then
+                -- only flush host rules.
+                if not refresh_all_hosts_qos(dev_name, direction, g_htb_major_id[direction], total_width*g_host_rate_factor, total_width ) then
+                    return false
+                end
+            else
+                logger(3,'not supported operation.')
+                return false
+            end
+        end
+    end
+
+    -- 切换ipmac状态信息表
+    g_crt_ipmac_map = nil
+    g_crt_ipmac_map = copytab(g_nxt_ipmac_map)
+    g_nxt_ipmac_map = nil
+
+    return true
+end
+
+function flush_prio_qos(band_changed)
+
+    local act
+    if band_changed then
+        act = 'change'
+        logger(3,'======== QoS TC-PRIO CHANGE. ============')
+    else
+        act = 'add'
+        logger(3,'======== QoS TC-PRIO ON. ============')
+    end
+
+    for seq,flow_item in pairs(g_flow_type) do
+        tc_fixed_prio_root_qdisc_class_filters(flow_item['dev'], flow_item['root'], act, cfg_bandwidth[flow_item['direction']], flow_item['direction'])
+    end
+
+end
+
+-----------------------------------------------------------------------------
+--  run QOS
+-----------------------------------------------------------------------------
+function update_QOS()
+
+    -- 如果ifb状态未UP,则尝试UP
+    if g_ifb_status ~= UP then
+        --check if dev ifb0 is up
+        local ifb_up = '/usr/sbin/ip link set ' .. g_ifb .. ' up '
+        local ifb_check = '/usr/sbin/ip link show ' .. g_ifb .. ' |grep "state DOWN"'
+        local ret = util.exec(ifb_up)
+        ret = util.exec(ifb_check)
+        if ret == '' then
+            g_ifb_status = UP
+        else
+            logger(3, 'ifb0 is not up, wait for next link up.')
+            return false    -- 继续下一次set link up
+        end
+    end
+
+    g_flow_type = update_flow_type()
+
+    -- 读取配置文件
+    if not read_uci_conf() then
+        logger(3,'read config failed, exit!')
+        return false
+    end
+
+    -- 状态2下
+    if g_QOS_Status == 2 then
+        -- to exit
+        if g_close_prio  == 1 then
+            -- 设置状态为OFF,并且清除所有规则
+            g_QOS_Status = 0
+            cur_qos_enabled = '0'
+            cleanup_system()
+            return true
+        end
+
+        -- to close htb
+        if cfg_qos_enabled == '0' then
+            cleanup_htb()
+            g_QOS_Status = 1
+            cur_qos_enabled = '0'
+            return true
+        else  -- status 2 cycle
+            if not flush_qos_rules() then
+                cleanup_system()
+                logger(3, 'Update QoS rules failed, cleanup QOS.')
+            end
+        end
+        return true
+    end
+
+    -- 状态0下，未设置顶层prio
+    if g_QOS_Status == 0 then
+        cur_qos_enabled = '0'
+        if g_close_prio  ~= 1 then   -- open prio, status 0 -> 1
+            flush_prio_qos(false)
+            g_QOS_Status = 1    -- continue
+        else
+            return true
+        end
+    end
+
+    -- 状态1下
+    if g_QOS_Status == 1 then
+        -- to close deamon
+        if g_close_prio  == 1 then  -- close prio, status 1 -> 0
+            g_QOS_Status = 0
+            cur_qos_enabled = '0'
+            cleanup_system()    -- clear prio
+            return true
+        end
+
+        -- QoS TC-HTB  is OFF
+        if cfg_qos_enabled == '0' then
+            -- 调用了change_band，需要修改prio tbf参数
+            if cfg_changed == 'ALL' then   -- status 1 cycle
+                flush_prio_qos(true)
+            end
+            return true
+        else  -- open htb, status 1 -> 2
+            -- is OPEN, add htb, change status
+            if not flush_qos_rules() then
+                cleanup_htb()
+                logger(3, 'Update QoS rules failed, cleanup QOS.')
+                return true
+            else
+                g_QOS_Status = 2     -- QoS TC-HTB 已经开启
+                cur_qos_enabled = '1'
+            end
+        end
+        return true
+    end
+
+    return true
+end
+
+-----------------------------------------------------------------------------
+--  get tc limit counters
+-----------------------------------------------------------------------------
+function update_tc_counters()
+
+    if cur_qos_enabled == '0' then
+        return
+    end
+
+    local up_id=g_htb_major_id[UP]
+    local down_id=g_htb_major_id[DOWN]
+
+    local tc_counters={
+            [up_id]={},   -- uplink
+            [down_id]={},   -- downlink
+    }
+    for k,v in pairs({g_wan_if, g_lan_if}) do
+        local w={}
+        local pp=io.popen(string.format(const_tc_dump, v))
+        local data=pp:read("*line")
+        local lineno=1
+
+        while data do
+            -- 1st line
+            local first,_,ldir,lclass,lrate,lceil =  string.find(data,"class htb (%d+):(%w+).*rate (%w+) ceil (%w+)")
+            if first then
+                if not tc_counters[ldir][lclass] then
+                    tc_counters[ldir][lclass] = {}
+                end
+
+                tc_counters[ldir][lclass]['r'] = lrate
+                tc_counters[ldir][lclass]['c'] = lceil
+            end
+            data = pp:read('*line')
+        end
+        pp:close()
+    end
+
+    -- 清空先
+    g_limit={}
+    local maxup, maxdown, minup, mindown= 0, 0, 0, 0
+    local tmp_id
+    for k,v in pairs(g_crt_ipmac_map) do
+        tmp_id = dec2hexstr(v['id']*0x10)
+        if tc_counters[up_id][tmp_id] then
+            maxup = tc_counters[up_id][tmp_id]['c']
+            minup = tc_counters[up_id][tmp_id]['r']
+        end
+
+        if tc_counters[down_id][tmp_id] then
+            maxdown = tc_counters[down_id][tmp_id]['c']
+            mindown = tc_counters[down_id][tmp_id]['r']
+        end
+
+        local up,down
+        local mac = v['mac']
+        if mac and group_def[mac] then
+            up={max_per=group_def[mac]['max_grp_uplink'], min_per=group_def[mac]['min_grp_uplink'], max_cfg=math.ceil(group_def[mac]['max_grp_uplink']*cfg_bandwidth[UP]),max=maxup, min_cfg=math.ceil(group_def[mac]['min_grp_uplink']*cfg_bandwidth[UP]), min=minup}
+            down={max_per=group_def[mac]['max_grp_downlink'], min_per=group_def[mac]['min_grp_downlink'], max_cfg=math.ceil(group_def[mac]['max_grp_downlink']*cfg_bandwidth[DOWN]), max=maxdown,min_cfg=math.ceil(group_def[mac]['min_grp_downlink']*cfg_bandwidth[DOWN]),min=mindown}
+        else
+            up={max_per=1,min_per=0.5,max_cfg=0, max=maxup,min_cfg=0, min=minup}
+            down={max_per=1,min_per=0.5,max_cfg=0, max=maxdown,min_cfg=0,min=mindown}
+        end
+        g_limit[k]={MAC=mac,UP=up,DOWN=down}
+    end
+
+end
+
+function uci_commit_save(flag)
+    if flag then
+        g_cursor:commit('miqos')
+
+        -- tmp下的配置改变,复写回/etc下
+        if not tmp2cfg() then
+            logger(1, 'copy tmp cfg to /etc/config/ failed.')
+        end
+    end
+end
+
+-----------------------------------------------------------------------------
+--  configuration operation, add/chg, del, update
+-----------------------------------------------------------------------------
+function add_or_change_group(mac, maxup, maxdown,minup,mindown, todisk)
+
+    local str_mac=string.upper(mac)
+    local mac_name=string.gsub(str_mac,':','')
+    local all=g_cursor:get_all('miqos')
+    local name = ''
+    for k,v in pairs(all) do
+        if v['.type'] == 'group' and v['name'] == str_mac then
+            name = k
+            break
+        end
+    end
+
+    if name == '' then
+        name = g_cursor:section('miqos','group',mac_name)
+        g_cursor:set('miqos',name,'name',str_mac)
+        g_cursor:set('miqos',name,'min_grp_uplink','0.5')
+        g_cursor:set('miqos',name,'min_grp_downlink','0.5')
+        g_cursor:set('miqos',name,'max_grp_uplink','1')
+        g_cursor:set('miqos',name,'max_grp_downlink','1')
+        g_cursor:set('miqos',name,'mode','general')
+        g_cursor:set('miqos',name,'mac',{str_mac})
+    end
+
+    local tmp_num
+    if minup then
+        tmp_num = tonumber(minup)
+        if tmp_num <= 0 or tmp_num > 1 then
+            minup = g_default_min_updown_factor
+            logger(3,'setting min reserve out of range, set it to default value.')
+        end
+        g_cursor:set('miqos',name,'min_grp_uplink',minup)
+    end
+    if mindown then
+        tmp_num = tonumber(mindown)
+        if tmp_num <= 0 or tmp_num > 1 then
+            mindown = g_default_min_updown_factor
+            logger(3,'setting min reserve out of range, set it to default value.')
+        end
+        g_cursor:set('miqos',name,'min_grp_downlink',mindown)
+    end
+    if maxup then
+        tmp_num = tonumber(maxup)
+        if tmp_num <= 0 or tmp_num > 1 then
+            maxup = 1
+            logger(3,'setting min reserve out of range, set it to default value.')
+        end
+        g_cursor:set('miqos',name,'max_grp_uplink',maxup)
+    end
+    if maxdown then
+        tmp_num = tonumber(maxdown)
+        if tmp_num <= 0 or tmp_num > 1 then
+            maxdown = 1
+            logger(3,'setting min reserve out of range, set it to default value.')
+        end
+        g_cursor:set('miqos',name,'max_grp_downlink',maxdown)
+    end
+
+    uci_commit_save(todisk)
+end
+
+function update_qos_auto_mode(mode, todisk)
+
+    g_cursor:set('miqos','settings','qos_auto',mode)
+
+    uci_commit_save(todisk)
+end
+
+function del_group(mac, todisk)
+
+    local all=g_cursor:get_all('miqos')
+
+    if mac then
+        local str_mac = string.upper(mac)
+        for k,v in pairs(all) do
+            if v['.type'] == 'group' and v['name'] == str_mac then
+                g_cursor:delete('miqos',k)
+                break
+            end
+        end
+    else
+        for k,v in pairs(all) do
+            if v['.type'] == 'group' and v['name'] ~= '00' then
+                g_cursor:delete('miqos',k)
+            end
+        end
+    end
+
+    uci_commit_save(todisk)
+end
+
+function update_bw(max_up,max_down, todisk)
+
+    if tonumber(max_up) >= 0 and tonumber(max_down) >= 0 then
+        g_cursor:set('miqos','settings','upload',max_up)
+        g_cursor:set('miqos','settings','download',max_down)
+
+        uci_commit_save(todisk)
+        return true
+    end
+    return false
+end
+
+function update_qos_enabled(qos_on_flag)
+    if qos_on_flag then
+        g_cursor:set('miqos','settings','enabled','1')
+    else
+        g_cursor:set('miqos','settings','enabled','0')
+    end
+
+    g_cursor:commit('miqos')
+end
+
+function update_guest_percent(in_up,in_down,todisk)
+    if in_up <0 or in_up >1 then in_up = 1 end
+    if in_up == 0 then in_up =0.5 end
+    if in_down <0 or in_down >1 then in_down = 1 end
+    if in_down == 0 then in_down=0.5 end
+
+    g_cursor:set('miqos','guest','up_per',in_up)
+    g_cursor:set('miqos','guest','down_per',in_down)
+
+    uci_commit_save(todisk)
+    return true
+end
+
+function get_guest_percent()
+    local up,down
+    up = g_cursor:get('miqos','guest','up_per') or g_guest_default_band
+    down = g_cursor:get('miqos','guest','down_per') or g_guest_default_band
+    return up,down
+end
+
+function get_bw()
+    local up = g_cursor:get('miqos','settings','upload') or '0'
+    local down=g_cursor:get('miqos','settings','download') or '0'
+    return up,down
+end
+
+function get_uptime()
+    local pp=io.open('/proc/uptime')
+    local n=pp:read('*n')
+    return math.ceil(n)
+end
+
+-----------------------------------------------------------------------------
+--  loop work for QOS
+-----------------------------------------------------------------------------
+function main_loop()
+
+    local server=assert(socket.bind(cfg_host,cfg_port))
+    server:settimeout(1)
+
+    local now_time = get_uptime()
+    local next_qos_time = now_time
+    local delta
+    local gc_timer=0
+
+    -- tables for select event
+    local set=newset()
+    set:insert(server)    -- add 'server' into select events
+
+    while true do
+
+        now_time = get_uptime()       -- 读取当前的uptime ticks
+        if now_time >= next_qos_time then
+            if update_QOS() then
+                gc_timer = gc_timer + 1
+                if gc_timer >= 30 then
+                    gc_timer = 0
+                    local tmp_cnt = collectgarbage('count')
+                    logger(3, "Current status: --> " .. g_QOS_Status .. ',LUA GC counter: ' .. tmp_cnt)
+                end
+                if g_debug then
+                    logger(3, "Current status: --> " .. g_QOS_Status)
+                end
+                -- 更新tc的counters,便于直接调用返回
+                update_tc_counters()
+            end
+            next_qos_time = now_time + cfg_qos_check_interval      -- 更新下一次update QOS检测时间
+        end
+
+        delta = next_qos_time - now_time
+        -- logger(3,"TIME:" .. delta .. ' = '.. next_qos_time .. '-' .. now_time)
+        if delta > cfg_qos_check_interval then
+            logger(3, "Warning!!! plz check Update QoS delta = " .. delta .. ", it's too long!!!!")
+            delta = cfg_qos_check_interval
+        end
+
+        local readable, _, error = socket.select(set, nil , delta)
+        for _,v in ipairs(readable) do
+
+            if v == server then
+                -- logger(3, 'new client come in ...')
+
+                local clt=v:accept()
+                if clt then
+                    clt:settimeout(1)
+                    set:insert(clt)
+                else
+                    logger(3, 'accept client error.')
+                end
+            else
+                local data,error = v:receive()
+
+                if error then
+                    v:close()
+                    -- logger(3, 'client is disconnected.')
+                    set:remove(v)
+                else
+                    local args=string.split(data,' ')
+                    if not args[1] then
+                        v:send(json.encode({status=3}))
+                    else
+                        if args[1] == 'on' then
+                            -- uci on QoS TC-HTB  done before send on command
+                            next_qos_time = 0
+                            g_close_prio  = 0  -- keep prio and htb on
+                            update_qos_enabled(true)
+                            v:send(json.encode({status=0}))
+                            logger(3,'======== QoS TC-HTB  ON. ============')
+                        elseif args[1] == 'off' then
+                            next_qos_time = 0
+                            g_close_prio = 0   -- keep prio, but clean htb
+                            update_qos_enabled(false)
+                            v:send(json.encode({status=0}))
+                            logger(3,'======== QoS TC-HTB  OFF. ============')
+                        elseif args[1] == 'shutdown' then
+                            g_close_prio  = 1   -- clean prio and htb
+                            next_qos_time = 0
+                            v:send(json.encode({status=0}))
+                        elseif args[1] == 'die' then
+                            v:send(json.encode({status=0}) .. "\n")
+                            v:close()
+                            system_exit()    -- exit system
+                        elseif args[1] == 'change_band' then
+                            if args[2] and args[3] then
+                                if update_bw(args[2],args[3],true) then
+                                    v:send(json.encode({status=0}))
+                                    cfg_changed = 'ALL'
+                                    next_qos_time = 0
+                                else
+                                    v:send(json.encode({status=3,data='parameter foramt error.'}))
+                                end
+                            else
+                                v:send(json.encode({status=1, data='parameter lost'}))
+                            end
+
+                        elseif args[1] == 'show_band' then     -- get current setting band-width
+                            local u,d = get_bw()
+                            v:send(json.encode({status=0,data={uplink=u,downlink=d}}))
+
+
+                        else
+
+                            if cur_qos_enabled == '0' then
+                                v:send(json.encode({status=4,data='qos disabled.'}))
+                            else
+
+                                if args[1] == 'show_limit' then
+                                    local ret={}
+                                    -- 在每次更新之后进行调用
+                                    -- local g_limit = update_tc_counters()
+                                    if args[2] then
+                                        local mac=string.upper(args[2])
+
+                                        if g_limit[args[2]] then
+                                            ret[args[2]] = g_limit[args[2]]
+                                            v:send(json.encode({status=0,data=ret}))
+                                        else
+                                            ret[args[2]] = {status=3,data='not exist ip/device.'}
+                                            v:send(json.encode({status=3,data='not exist ip/device.'}))
+                                        end
+                                    else
+                                        v:send(json.encode({status=0,data=g_limit}))
+                                    end
+
+                                elseif args[1] == 'on_limit' or args[1] == 'set_limit' then    -- add/modify cfg
+                                    local result={status=0}
+                                    if not args[2] or not args[3] then
+                                        result = {status=1,data='limit type + mac parameter lost.'}
+                                    else
+                                        local active_soon = false
+                                        if args[1] == 'on_limit' then
+                                            active_soon = true
+                                            cfg_changed, next_qos_time = 'HOST',0
+                                        end
+
+                                        --[[
+                                        --here commented temporarily and open it with UI
+                                        if args[2] == 'max' then
+                                            add_or_change_group(args[3],args[4],args[5],nil,nil,active_soon)
+                                        elseif args[2] == 'min' then
+                                            add_or_change_group(args[3],nil,nil,args[4],args[5],active_soon)
+                                        elseif args[2] == 'all' then
+                                            add_or_change_group(args[3],args[4],args[5],args[6],args[7],active_soon)
+                                        else
+                                            cfg_changed = ''
+                                            result = {status=1,data='not supported limit type.'}
+                                        end
+                                        ]]--
+
+                                        add_or_change_group(args[2],args[3],args[4],args[5],args[6], active_soon)
+                                    end
+                                    v:send(json.encode(result))
+
+                                elseif args[1] == 'off_limit' or args[1] == 'reset_limit' then
+                                    local tobe_del = args[2]
+                                    if args[1] == 'off_limit' then
+                                        cfg_changed = 'HOST'
+                                        next_qos_time = 0
+                                        del_group(tobe_del, true)
+                                    else
+                                        del_group(tobe_del, false)
+                                    end
+                                    v:send(json.encode({status=0}))
+
+                                elseif args[1] == 'auto' or args[1] == 'set_auto' then
+                                    if args[2] and args[2] == 'on' then
+                                        QOS_AUTO = '1'
+                                    else
+                                        QOS_AUTO = '0'
+                                    end
+
+                                    if args[1] == 'auto' then
+                                        update_qos_auto_mode(QOS_AUTO, true)
+                                        cfg_changed = 'HOST'
+                                        next_qos_time = 0
+                                    else
+                                        update_qos_auto_mode(QOS_AUTO, false)
+                                    end
+                                    v:send(json.encode({status=0}))
+
+                                elseif args[1] == 'apply' then
+                                    -- 保存并使生效
+                                    uci_commit_save(true)
+                                    if args[2] and args[2] == 'all' then
+                                        cfg_changed='ALL'
+                                    else
+                                        cfg_changed='HOST'
+                                    end
+                                    next_qos_time = 0
+                                    v:send(json.encode({status=0}))
+                                elseif args[1] == 'on_guest' then
+                                    if args[2] and args[3] then
+                                        local up_p,down_p = tonumber(args[2]),tonumber(args[3])
+                                        update_guest_percent(up_p,down_p,true)
+                                        next_qos_time = 0
+                                        cfg_changed = 'ALL'
+                                        v:send(json.encode({status=1,data='ok'}))
+                                    else
+                                        v:send(json.encode({status=2,data='parameter wrong.'}))
+                                    end
+                                else
+                                    v:send(json.encode({status=2,data='Not supported command.'}))
+                                end
+                            end
+                        end
+                    end
+
+                    v:send('\n')
+                    v:close()
+                    set:remove(v)
+                end
+            end
+        end
+    end
+end
+
+
+--[[main]]-------------------
+function main()
+
+    if system_init() then
+        local s, e = pcall(function() main_loop() end)
+        if not s
+        then
+            logger(3,e)
+            cleanup_system()
+        end
+    else
+        logger(3, 'system initial failed. exit.')
+    end
+end
+
+main()
+
+--[[main end]]-------------------

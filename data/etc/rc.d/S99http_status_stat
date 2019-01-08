@@ -1,0 +1,83 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+
+set_switch_on="uci set http_status_stat.settings.enabled=1"
+set_switch_off="uci set http_status_stat.settings.enabled=0"
+set_switch_commit="uci commit http_status_stat"
+
+APP_CTF_MGR="/usr/sbin/ctf_manger.sh"
+export EXTRA_COMMANDS=" on off status "
+export EXTRA_HELP="	on	Switch to the start state and start
+	off	Switch to the stop state and stop"
+
+model=""
+get_model()
+{
+    model=`nvram get model`
+    if [ -z "$model" ]; then
+        model=`cat /proc/xiaoqiang/model`
+    fi
+}
+
+start() {
+    config_load "http_status_stat"
+    local switch
+    switch=`uci get http_status_stat.settings.enabled 2>/dev/null`
+    if [ $switch -ne "1" ]; then
+        return 0
+    fi
+
+    get_model
+    if [ $model == "R1D" ]; then
+        if [ -f $APP_CTF_MGR ]; then
+            $APP_CTF_MGR http_stat http on
+        fi
+    elif [ $model == "R1CM" ]; then
+        #config_load "hwnat"
+        uci set hwnat.switch.http_stat=1
+        uci commit hwnat
+        /etc/init.d/hwnat stop &>/dev/null
+    else
+        echo "http_status_stat.init: unknown model type!"
+        return 0
+    fi
+    insmod http_status_code_handle >/dev/null 2>&1
+    return 0
+}
+
+stop() {
+    rmmod http_status_code_handle >/dev/null 2>&1
+
+    get_model
+    if [ $model == "R1D" ]; then
+        if [ -f $APP_CTF_MGR ]; then
+            $APP_CTF_MGR http_stat http off
+        fi
+    elif [ "$model" == "R1CM" ]; then
+        #config_load "hwnat"
+        uci set hwnat.switch.http_stat=0
+        uci commit hwnat
+        /etc/init.d/hwnat start &>/dev/null
+    else
+        echo "http_status_stat.init: unknown model type!"
+        return 0
+    fi
+    return 0
+}
+
+off(){
+    stop
+    $set_switch_off >/dev/null 2>&1
+    $set_switch_commit >/dev/null 2>&1
+    return $?
+}
+
+on(){
+    $set_switch_on >/dev/null 2>&1
+    $set_switch_commit >/dev/null 2>&1
+
+    start
+    return $?
+}
+

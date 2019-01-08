@@ -1,0 +1,20 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+LOGNAME=root
+USER=root
+export PATH LOGNAME USER
+
+ubus call trafficd version || {
+	for PID in $(ps | grep trafficd | grep -v grep | grep -v $0 |  awk '{print $1}'); do(
+		kill -SIGTERM  $PID
+	); done
+
+	/etc/init.d/trafficd stop
+	for PID in $(ps | grep trafficd | grep -v grep | grep -v $0 |  awk '{print $1}'); do(
+		kill -SIGKILL  $PID
+	); done
+	/etc/init.d/trafficd start
+}

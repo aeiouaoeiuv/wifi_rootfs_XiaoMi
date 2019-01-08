@@ -1,0 +1,30 @@
+#!/bin/sh
+
+SCRIP_PATH='/lib/dnsmasq/lease.d'
+
+dlog() {
+    logger -s -p 6 -t "dnsmasq.d" "$@"
+}
+
+run_add_scripts() {
+    dlog "Begin run dns add script in $SCRIP_PATH"
+    for i in $SCRIP_PATH/*; do
+	local mac="$1"
+	shift
+	dlog "exec $i $mac $@"
+	$i "$mac" "$@" 2>&1
+    done
+    dlog "End run script"
+}
+
+case "$1" in
+    add)
+	shift
+	run_add_scripts "$@"
+    ;;
+    old)
+    ;;
+    del)
+    ;;
+esac
+

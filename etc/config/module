@@ -1,0 +1,5 @@
+config core 'common'
+    option 'channel_select' 1
+    option 'share_folder' '1'
+    option 'wifi_security' '1'
+    option 'open_ssid' '1'

@@ -1,0 +1,13 @@
+#! /bin/sh
+
+. /lib/functions.sh
+
+config_load misc
+config_get op switchop lan_count
+count=$(eval "$op")
+count=${count:-0}
+logger -t stat_points_privacy lan_port_count=$count
+
+config_load xiaoqiang
+config_get mode common NETMODE
+[ -z "$mode" ] || logger stat_points_privacy net_mode="$mode"

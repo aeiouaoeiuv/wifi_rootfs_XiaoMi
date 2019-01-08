@@ -1,0 +1,62 @@
+html,body {
+	height: 100%;
+}
+body {
+	background-size: cover;
+	background-repeat: no-repeat;
+	background-position: center 0;
+}
+@media only screen and (min-device-width : 768px) and (max-device-width : 1024px) {
+	/* Smartphones (landscape) ----------- */
+	@media (orientation : landscape) {
+		body {
+			background-image:url(../img/welcome_h.png);
+		}
+	}
+	/* Smartphones (portrait) ----------- */
+	@media (orientation : portrait) {
+		body {
+			background-image:url(../img/welcome.png);
+		}
+	}
+}
+/* iPhone <= 4s (portrait and landscape) ----------- */
+@media only screen and (min-device-width : 320px) and (max-device-width : 480px) {
+	/* Smartphones (landscape) ----------- */
+	@media (orientation : landscape) {
+		body {
+			background-image:url(../img/welcome_h.png);
+		}
+	}
+	/* Smartphones (portrait) ----------- */
+	@media (orientation : portrait) {
+		body {
+			background-image:url(../img/welcome.png);
+		}
+	}
+}
+/* iPhone >= 5 (portrait and landscape) ----------- */
+@media only screen and (min-device-width : 320px) and (max-device-width : 568px) {
+	/* Smartphones (landscape) ----------- */
+	@media (orientation : landscape) {
+		body {
+			background-image:url(../img/welcome_h.png);
+		}
+	}
+	/* Smartphones (portrait) ----------- */
+	@media (orientation : portrait) {
+		body {
+			background-image:url(../img/welcome.png);
+		}
+	}
+}
+@media only screen and (min-width : 361px) {
+	body {
+		background-image:url(../img/welcome_h.png);
+	}
+}
+@media only screen and (max-width : 360px) {
+	body {
+		background-image:url(../img/welcome.png);
+	}
+}
